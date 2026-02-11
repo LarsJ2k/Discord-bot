@@ -11,7 +11,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 
-# Prefix is only the prefix
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 DATA_FILE = "worker_data.json"
@@ -44,8 +43,8 @@ def ensure_guild(guild_id: int):
     if str(guild_id) not in data:
         data[str(guild_id)] = {
             "roles": [],
-            "channel_setups": {},  # keyed by command-channel-id (string)
-            "timezone": 0
+            "channel_setups": {},  # keyed by command-channel-id (string) -> {post_channel_id, role_id}
+            "timezone": 0          # GMT offset for entering HH:MM
         }
 
 
@@ -59,8 +58,21 @@ def has_permission(member: discord.Member, guild_id: int) -> bool:
 
 
 # ------------------ TIME ------------------
-def get_now_utc() -> datetime:
+def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def utc_to_local(dt_utc: datetime, offset_hours: int) -> datetime:
+    """Convert UTC-aware dt to 'guild local' (still aware)."""
+    return dt_utc + timedelta(hours=offset_hours)
+
+
+def local_naive_to_utc(dt_local_naive: datetime, offset_hours: int) -> datetime:
+    """
+    Interpret dt_local_naive as guild-local clock time (UTC+offset).
+    Convert to UTC-aware datetime.
+    """
+    return (dt_local_naive - timedelta(hours=offset_hours)).replace(tzinfo=timezone.utc)
 
 
 # ------------------ HELPERS ------------------
@@ -85,23 +97,9 @@ def find_setup_for_post_channel(guild_id: int, post_channel_id: int):
     return None
 
 
-def local_offset_to_utc(dt_local: datetime, offset_hours: int) -> datetime:
-    """
-    Interpret dt_local as 'guild local time' = UTC + offset_hours.
-    Convert to UTC-aware datetime.
-    """
-    # dt_local is naive; treat it as offset time and convert to UTC:
-    return (dt_local - timedelta(hours=offset_hours)).replace(tzinfo=timezone.utc)
-
-
-def utc_to_local_for_display(dt_utc: datetime, offset_hours: int) -> datetime:
-    """Only used for comparisons vs today in guild-local sense."""
-    return dt_utc + timedelta(hours=offset_hours)
-
-
 # ------------------ DASHBOARD ------------------
 async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
-    # Prevent double-post race (send vs send)
+    # Prevent send/send race creating duplicate dashboard posts
     key = (guild_id, post_channel.id)
     lock = dashboard_locks.setdefault(key, asyncio.Lock())
 
@@ -114,7 +112,7 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
             for uid in empty_users:
                 post_alarms.pop(uid, None)
 
-        # Remove dashboard if empty
+        # Remove dashboard if no alarms left
         if not post_alarms:
             if guild_id in dashboard_messages and post_channel.id in dashboard_messages[guild_id]:
                 try:
@@ -123,30 +121,32 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
                     pass
                 dashboard_messages[guild_id].pop(post_channel.id, None)
 
-            # Cancel live dashboard task
             if guild_id in dashboard_tasks and post_channel.id in dashboard_tasks[guild_id]:
                 dashboard_tasks[guild_id][post_channel.id].cancel()
                 dashboard_tasks[guild_id].pop(post_channel.id, None)
+
+            dashboard_locks.pop(key, None)
             return
 
         setup = find_setup_for_post_channel(guild_id, post_channel.id)
         role_mention = f"<@&{setup['role_id']}>" if setup else ""
+
         embed = discord.Embed(title="🔔 Upcoming Workers", color=discord.Color.blue())
 
-        # ---- Build blocks in chronological order ----
+        # Build blocks in chronological order
         items = []
-        for user_id, user_alarms in post_alarms.items():
-            for time_str, alarm_data in user_alarms.items():
+        for _user_id, user_alarms in post_alarms.items():
+            for _time_str, alarm_data in user_alarms.items():
                 items.append(alarm_data)
 
-        items.sort(key=lambda a: a["end_datetime"])  # end_datetime is UTC-aware
+        items.sort(key=lambda a: a["end_datetime"])  # UTC-aware
 
         blocks = []
         for alarm_data in items:
             name = alarm_data["name"]
             bid = alarm_data["bid"]
-            end_dt = alarm_data["end_datetime"]              # UTC-aware
-            begin_dt = end_dt - timedelta(minutes=55)        # UTC-aware
+            end_dt = alarm_data["end_datetime"]        # UTC-aware
+            begin_dt = end_dt - timedelta(minutes=55)  # UTC-aware
 
             begin_ts = int(begin_dt.timestamp())
             end_ts = int(end_dt.timestamp())
@@ -180,66 +180,6 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
                 dashboard_messages[guild_id][post_channel.id] = msg
 
 
-# --- DELETE SETUP (admin) ---
-if action == "delete":
-    if not ctx.author.guild_permissions.administrator:
-        await ctx.send("Admin only command.")
-        return
-
-    if not arg1:
-        await ctx.send("Usage: `!worker delete #post-channel`")
-        return
-
-    try:
-        post_channel = await commands.TextChannelConverter().convert(ctx, arg1)
-    except commands.BadArgument:
-        await ctx.send("Usage: `!worker delete #post-channel`")
-        return
-
-    # Find matching setup (command channel → post channel)
-    setups = data[str(guild_id)]["channel_setups"]
-    cmd_channel_to_remove = None
-
-    for cmd_channel_id, info in setups.items():
-        if info.get("post_channel_id") == post_channel.id:
-            cmd_channel_to_remove = cmd_channel_id
-            break
-
-    if not cmd_channel_to_remove:
-        await ctx.send("No setup found for that channel.")
-        return
-
-    # ---- STOP DASHBOARD TASK ----
-    if guild_id in dashboard_tasks and post_channel.id in dashboard_tasks[guild_id]:
-        dashboard_tasks[guild_id][post_channel.id].cancel()
-        dashboard_tasks[guild_id].pop(post_channel.id, None)
-
-    # ---- DELETE DASHBOARD MESSAGE ----
-    if guild_id in dashboard_messages and post_channel.id in dashboard_messages[guild_id]:
-        try:
-            await dashboard_messages[guild_id][post_channel.id].delete()
-        except:
-            pass
-        dashboard_messages[guild_id].pop(post_channel.id, None)
-
-    # ---- CANCEL ALL ALARMS IN THIS CHANNEL ----
-    if guild_id in alarms and post_channel.id in alarms[guild_id]:
-        for user_id, user_alarms in alarms[guild_id][post_channel.id].items():
-            for alarm in user_alarms.values():
-                alarm["task"].cancel()
-        alarms[guild_id].pop(post_channel.id, None)
-
-    # ---- REMOVE LOCK ----
-    dashboard_locks.pop((guild_id, post_channel.id), None)
-
-    # ---- REMOVE FROM PERSISTENT DATA ----
-    setups.pop(cmd_channel_to_remove)
-    save_data()
-
-    await ctx.send(f"✅ Worker setup removed for {post_channel.mention}")
-    return
-
-
 # ------------------ LIVE DASHBOARD TASK ------------------
 async def live_dashboard_task(guild_id: int, post_channel: discord.TextChannel):
     try:
@@ -255,7 +195,7 @@ async def run_alarm(
     guild_id: int,
     post_channel: discord.TextChannel,
     user_id: int,
-    end_datetime_utc: datetime,
+    end_utc: datetime,
     time_str: str,
     name: str,
     bid: str,
@@ -266,14 +206,14 @@ async def run_alarm(
 
     try:
         for minutes in warnings:
-            wait_seconds = (end_datetime_utc - timedelta(minutes=minutes) - get_now_utc()).total_seconds()
+            wait_seconds = (end_utc - timedelta(minutes=minutes) - now_utc()).total_seconds()
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
                 await post_channel.send(
                     f"{role_mention} ⏳ — {minutes} minute(s) until **{name}** ({bid}) at {time_str}!"
                 )
 
-        wait_seconds = (end_datetime_utc - get_now_utc()).total_seconds()
+        wait_seconds = (end_utc - now_utc()).total_seconds()
         if wait_seconds > 0:
             await asyncio.sleep(wait_seconds)
 
@@ -282,7 +222,7 @@ async def run_alarm(
         )
 
     except asyncio.CancelledError:
-        # Silent cancel (command handler already confirms)
+        # Silent cancel: command handler already confirmed
         raise
 
     finally:
@@ -298,6 +238,7 @@ async def worker_help(ctx: commands.Context):
         "`!worker + HH:MM Name [Bid]` — add alarm\n"
         "`!worker - HH:MM` — remove alarm\n"
         "`!worker setup #post-channel @Role` — set post channel & role (admin)\n"
+        "`!worker delete #post-channel` — remove setup for a post channel (admin)\n"
         "`!worker timezone X` — set GMT offset (admin, -12..+14)\n"
         "`!worker AddRole @Role` — allow role to use bot (admin)\n"
         "`!worker RemoveRole @Role` — remove allowed role (admin)\n"
@@ -342,6 +283,64 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
         }
         save_data()
         await ctx.send(f"✅ Setup complete: Alarms will post in {post_channel.mention} and ping {role.mention}")
+        return
+
+    # --- DELETE SETUP (admin) ---
+    if action == "delete":
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("Admin only command.")
+            return
+        if not arg1:
+            await ctx.send("Usage: `!worker delete #post-channel`")
+            return
+
+        try:
+            post_channel = await commands.TextChannelConverter().convert(ctx, arg1)
+        except commands.BadArgument:
+            await ctx.send("Usage: `!worker delete #post-channel`")
+            return
+
+        setups = data[str(guild_id)]["channel_setups"]
+
+        # Find the command-channel mapping that points to this post-channel
+        cmd_channel_to_remove = None
+        for cmd_channel_id, info in setups.items():
+            if info.get("post_channel_id") == post_channel.id:
+                cmd_channel_to_remove = cmd_channel_id
+                break
+
+        if not cmd_channel_to_remove:
+            await ctx.send("No setup found for that post channel.")
+            return
+
+        # Stop live dashboard task
+        if guild_id in dashboard_tasks and post_channel.id in dashboard_tasks[guild_id]:
+            dashboard_tasks[guild_id][post_channel.id].cancel()
+            dashboard_tasks[guild_id].pop(post_channel.id, None)
+
+        # Delete dashboard message
+        if guild_id in dashboard_messages and post_channel.id in dashboard_messages[guild_id]:
+            try:
+                await dashboard_messages[guild_id][post_channel.id].delete()
+            except:
+                pass
+            dashboard_messages[guild_id].pop(post_channel.id, None)
+
+        # Cancel all alarms for that post channel
+        if guild_id in alarms and post_channel.id in alarms[guild_id]:
+            for _user_id, user_alarms in alarms[guild_id][post_channel.id].items():
+                for alarm in user_alarms.values():
+                    alarm["task"].cancel()
+            alarms[guild_id].pop(post_channel.id, None)
+
+        # Remove lock
+        dashboard_locks.pop((guild_id, post_channel.id), None)
+
+        # Remove persistent setup mapping
+        setups.pop(cmd_channel_to_remove, None)
+        save_data()
+
+        await ctx.send(f"✅ Worker setup removed for {post_channel.mention}")
         return
 
     # --- ROLE MANAGEMENT (admin) ---
@@ -440,16 +439,18 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
 
         offset = int(data[str(guild_id)]["timezone"])
 
-        # Build "guild local" datetime (naive), then convert to UTC aware
-        now_utc = get_now_utc()
-        now_local = utc_to_local_for_display(now_utc, offset)
+        # Determine "today" in guild-local time
+        now_u = now_utc()
+        now_local = utc_to_local(now_u, offset)
 
-        end_local_naive = datetime.combine(now_local.date(), end_time)  # naive local
-        # If time already passed in local time, schedule for next day
+        # Build naive local end datetime, then convert to UTC
+        end_local_naive = datetime.combine(now_local.date(), end_time)
+
+        # If time already passed in local, schedule next day
         if end_local_naive < now_local.replace(tzinfo=None):
             end_local_naive += timedelta(days=1)
 
-        end_utc = local_offset_to_utc(end_local_naive, offset)
+        end_utc = local_naive_to_utc(end_local_naive, offset)
 
         # Replace existing alarm for this user+time, if any
         existing = alarms[guild_id][post_channel.id][ctx.author.id].get(time_value)
@@ -464,10 +465,10 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
             "task": task,
             "name": name,
             "bid": bid,
-            "end_datetime": end_utc
+            "end_datetime": end_utc  # store UTC-aware so Discord <t:...> works correctly per viewer
         }
 
-        # Start live dashboard if not running (race-safe due to dashboard lock)
+        # Start live dashboard if not running
         dashboard_tasks.setdefault(guild_id, {})
         if post_channel.id not in dashboard_tasks[guild_id]:
             dashboard_tasks[guild_id][post_channel.id] = asyncio.create_task(
