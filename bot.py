@@ -14,6 +14,7 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 DATA_FILE = "data/worker_data.json"
+os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
 
 # ------------------ RUNTIME STORAGE ------------------
 # alarms: {guild_id: {post_channel_id: {user_id: {time_str: {"task":..., "name":..., "bid":..., "end_datetime":...}}}}}
@@ -145,18 +146,19 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
         for alarm_data in items:
             name = alarm_data["name"]
             bid = alarm_data["bid"]
-            end_dt = alarm_data["end_datetime"]        # UTC-aware
-            begin_dt = end_dt - timedelta(minutes=55)  # UTC-aware
-
+            end_dt = alarm_data["end_datetime"]
+            begin_dt = end_dt - timedelta(minutes=55)
+        
             begin_ts = int(begin_dt.timestamp())
             end_ts = int(end_dt.timestamp())
+        
+            blocks.append(
+                f"**{name}**\n"
+                f"Bid - {bid}\n"
+                f"🟢 Start      🏁 End      ⏳ Time left\n"
+                f"<t:{begin_ts}:t>      <t:{end_ts}:t>      <t:{end_ts}:R>"
+            )
 
-        blocks.append(
-            f"**{name}**\n"
-            f"Bid - {bid}\n"
-            f"🟢 Start      🏁 End      ⏳ Time left\n"
-            f"<t:{begin_ts}:t>      <t:{end_ts}:t>      <t:{end_ts}:R>"
-        )
 
 
         embed.description = "\n\n---\n\n".join(blocks)
