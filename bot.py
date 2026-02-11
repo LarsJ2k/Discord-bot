@@ -180,6 +180,66 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
                 dashboard_messages[guild_id][post_channel.id] = msg
 
 
+# --- DELETE SETUP (admin) ---
+if action == "delete":
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("Admin only command.")
+        return
+
+    if not arg1:
+        await ctx.send("Usage: `!worker delete #post-channel`")
+        return
+
+    try:
+        post_channel = await commands.TextChannelConverter().convert(ctx, arg1)
+    except commands.BadArgument:
+        await ctx.send("Usage: `!worker delete #post-channel`")
+        return
+
+    # Find matching setup (command channel → post channel)
+    setups = data[str(guild_id)]["channel_setups"]
+    cmd_channel_to_remove = None
+
+    for cmd_channel_id, info in setups.items():
+        if info.get("post_channel_id") == post_channel.id:
+            cmd_channel_to_remove = cmd_channel_id
+            break
+
+    if not cmd_channel_to_remove:
+        await ctx.send("No setup found for that channel.")
+        return
+
+    # ---- STOP DASHBOARD TASK ----
+    if guild_id in dashboard_tasks and post_channel.id in dashboard_tasks[guild_id]:
+        dashboard_tasks[guild_id][post_channel.id].cancel()
+        dashboard_tasks[guild_id].pop(post_channel.id, None)
+
+    # ---- DELETE DASHBOARD MESSAGE ----
+    if guild_id in dashboard_messages and post_channel.id in dashboard_messages[guild_id]:
+        try:
+            await dashboard_messages[guild_id][post_channel.id].delete()
+        except:
+            pass
+        dashboard_messages[guild_id].pop(post_channel.id, None)
+
+    # ---- CANCEL ALL ALARMS IN THIS CHANNEL ----
+    if guild_id in alarms and post_channel.id in alarms[guild_id]:
+        for user_id, user_alarms in alarms[guild_id][post_channel.id].items():
+            for alarm in user_alarms.values():
+                alarm["task"].cancel()
+        alarms[guild_id].pop(post_channel.id, None)
+
+    # ---- REMOVE LOCK ----
+    dashboard_locks.pop((guild_id, post_channel.id), None)
+
+    # ---- REMOVE FROM PERSISTENT DATA ----
+    setups.pop(cmd_channel_to_remove)
+    save_data()
+
+    await ctx.send(f"✅ Worker setup removed for {post_channel.mention}")
+    return
+
+
 # ------------------ LIVE DASHBOARD TASK ------------------
 async def live_dashboard_task(guild_id: int, post_channel: discord.TextChannel):
     try:
