@@ -10,12 +10,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!worker", intents=intents)
 
-DATA_FILE = "wrk_data.json"
+DATA_FILE = "worker_data.json"
 
 # ------------------ RUNTIME STORAGE ------------------
-alarms = {}  # {guild_id: {post_channel_id: {user_id: {time: {"task":..., "name":..., "bid":...}}}}}
+alarms = {}  # {guild_id: {post_channel_id: {user_id: {end_time_str: {"task":..., "name":..., "bid":..., "end_datetime":...}}}}}
 dashboard_messages = {}  # {guild_id: {post_channel_id: message}}
 dashboard_tasks = {}  # {guild_id: {post_channel_id: task}}
 data = {}  # persistent storage
@@ -62,6 +62,17 @@ def get_now(guild_id):
 
 
 # ------------------ DASHBOARD ------------------
+def human_readable_remaining(delta):
+    if delta.total_seconds() > 3600:
+        return f"in {int(delta.total_seconds() // 3600)} hours"
+    elif delta.total_seconds() > 60:
+        return f"in {int(delta.total_seconds() // 60)} minutes"
+    elif delta.total_seconds() > 0:
+        return "less than a minute"
+    else:
+        return "finished"
+
+
 async def update_dashboard(guild_id, post_channel):
     post_alarms = alarms.get(guild_id, {}).get(post_channel.id, {})
 
@@ -83,12 +94,11 @@ async def update_dashboard(guild_id, post_channel):
     setup = None
     ensure_guild(guild_id)
     setups = data[str(guild_id)]["channel_setups"]
-    if str(post_channel.id) in [s["post_channel_id"] for s in setups.values()]:
-        # Find the setup matching this post channel
-        for c_id, info in setups.items():
-            if info["post_channel_id"] == post_channel.id:
-                setup = info
-                break
+    for c_id, info in setups.items():
+        if info["post_channel_id"] == post_channel.id:
+            setup = info
+            break
+
     role_mention = f"<@&{setup['role_id']}>" if setup else ""
 
     embed = discord.Embed(
@@ -96,21 +106,22 @@ async def update_dashboard(guild_id, post_channel):
         color=discord.Color.blue()
     )
 
-    alarm_list = []
     for user_id in post_alarms:
-        for time_str, alarm_data in post_alarms[user_id].items():
+        for end_time_str, alarm_data in post_alarms[user_id].items():
             name = alarm_data["name"]
             bid = alarm_data["bid"]
-            remaining = alarm_data.get("target_datetime", get_now(guild_id)) - get_now(guild_id)
-            h, rem = divmod(int(remaining.total_seconds()), 3600)
-            m, s = divmod(rem, 60)
-            time_left = f"{h:02d}:{m:02d}:{s:02d}"
-            alarm_list.append(f"**{time_str}** — {name} ({bid}) — <@{user_id}> — {time_left}")
+            end_datetime = alarm_data["end_datetime"]
+            begin_datetime = end_datetime - timedelta(minutes=55)
+            remaining = end_datetime - get_now(guild_id)
+            time_left = human_readable_remaining(remaining)
 
-    alarm_list.sort()
-    embed.description = "\n".join(alarm_list)
-    embed.set_footer(text="WRK Alarm System")
+            embed.add_field(
+                name=f'"{name}"',
+                value=f'Bid - "{bid}"\n{begin_datetime.strftime("%H:%M")}          {end_datetime.strftime("%H:%M")}        {time_left}',
+                inline=False
+            )
 
+    embed.set_footer(text="Worker Alarm System")
     # Send or edit message
     if guild_id not in dashboard_messages:
         dashboard_messages[guild_id] = {}
@@ -132,58 +143,56 @@ async def live_dashboard_task(guild_id, post_channel):
 
 
 # ------------------ ALARM TASK ------------------
-async def run_alarm(ctx, guild_id, post_channel, target_datetime, time_string, name, bid):
-    setup = None
-    for cmd_id, info in data[str(guild_id)]["channel_setups"].items():
-        if info["post_channel_id"] == post_channel.id:
-            setup = info
-            break
+async def run_alarm(guild_id, post_channel, end_datetime, time_str, name, bid, setup):
     role_mention = f"<@&{setup['role_id']}>" if setup else ""
 
-    warnings = [10, 5, 1]
+    warnings = [10, 5, 1]  # minutes before end
     try:
         for minutes in warnings:
-            wait_seconds = (target_datetime - timedelta(minutes=minutes) - get_now(guild_id)).total_seconds()
+            wait_seconds = (end_datetime - timedelta(minutes=minutes) - get_now(guild_id)).total_seconds()
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
                 await post_channel.send(
-                    f"{role_mention} ⏳ {ctx.author.mention} — {minutes} minute(s) until **{name}** ({bid}) at {time_string}!"
+                    f"{role_mention} ⏳ — {minutes} minute(s) until **{name}** ({bid}) at {time_str}!"
                 )
 
-        wait_seconds = (target_datetime - get_now(guild_id)).total_seconds()
+        wait_seconds = (end_datetime - get_now(guild_id)).total_seconds()
         if wait_seconds > 0:
             await asyncio.sleep(wait_seconds)
 
         await post_channel.send(
-            f"{role_mention} 🚨 {ctx.author.mention} — ALARM for **{name}** ({bid}) — {time_string}!"
+            f"{role_mention} 🚨 — ALARM for **{name}** ({bid}) — {time_str}!"
         )
     except asyncio.CancelledError:
         await post_channel.send(
-            f"{role_mention} ❌ {ctx.author.mention} — Alarm for **{name}** ({bid}) was cancelled."
+            f"{role_mention} ❌ — Alarm for **{name}** ({bid}) was cancelled."
         )
     finally:
-        alarms[guild_id][post_channel.id][ctx.author.id].pop(time_string, None)
+        # Remove alarm from storage
+        for user_id, user_alarms in alarms[guild_id][post_channel.id].items():
+            if time_str in user_alarms:
+                user_alarms.pop(time_str)
         await update_dashboard(guild_id, post_channel)
 
 
-# ------------------ WRK COMMAND ------------------
+# ------------------ WORKER COMMAND ------------------
 @bot.command()
-async def wrk(ctx, action=None, arg1=None, arg2=None):
+async def worker(ctx, action=None, arg1=None, arg2=None):
     guild_id = ctx.guild.id
     ensure_guild(guild_id)
 
     # --- HELP ---
     if action == "help":
         await ctx.send(
-            "**WRK Commands**\n"
-            "`!wrk + HH:MM Name [Bid]`\n"
-            "`!wrk - HH:MM`\n"
-            "`!wrk timezone X`\n"
-            "`!wrk setup #post-channel @Role`\n"
-            "`!wrk AddRole @Role`\n"
-            "`!wrk RemoveRole @Role`\n"
-            "`!wrk ListRoles`\n"
-            "`!wrk help`"
+            "**Worker Commands**\n"
+            "`!worker + HH:MM Name [Bid]` — add alarm\n"
+            "`!worker - HH:MM` — remove alarm\n"
+            "`!worker setup #post-channel @Role` — set post channel & role\n"
+            "`!worker timezone X` — set GMT offset\n"
+            "`!worker AddRole @Role` — allow role to use bot\n"
+            "`!worker RemoveRole @Role`\n"
+            "`!worker ListRoles`\n"
+            "`!worker help`"
         )
         return
 
@@ -193,7 +202,7 @@ async def wrk(ctx, action=None, arg1=None, arg2=None):
             await ctx.send("Admin only command.")
             return
         if not isinstance(arg1, discord.TextChannel) or not isinstance(arg2, discord.Role):
-            await ctx.send("Usage: `!wrk setup #post-channel @Role`")
+            await ctx.send("Usage: `!worker setup #post-channel @Role`")
             return
 
         data[str(guild_id)]["channel_setups"][str(ctx.channel.id)] = {
@@ -201,7 +210,7 @@ async def wrk(ctx, action=None, arg1=None, arg2=None):
             "role_id": arg2.id
         }
         save_data()
-        await ctx.send(f"✅ Setup complete: Alarms will post in {arg1.mention} and tag {arg2.mention}")
+        await ctx.send(f"✅ Setup complete: Alarms will post in {arg1.mention} and ping {arg2.mention}")
         return
 
     # --- ROLE MANAGEMENT ---
@@ -235,7 +244,6 @@ async def wrk(ctx, action=None, arg1=None, arg2=None):
         return
 
     # --- ADD / REMOVE ALARM ---
-    # Restricted to command channels that have a setup
     if str(ctx.channel.id) not in data[str(guild_id)]["channel_setups"]:
         await ctx.send("This command can only be used in a setup command channel.")
         return
@@ -247,38 +255,38 @@ async def wrk(ctx, action=None, arg1=None, arg2=None):
     setup_info = data[str(guild_id)]["channel_setups"][str(ctx.channel.id)]
     post_channel = bot.get_channel(setup_info["post_channel_id"])
 
-    # ADD
+    # ADD ALARM
     if action == "+":
         try:
             parts = shlex.split(ctx.message.content)
             if len(parts) < 4:
-                await ctx.send("Usage: !wrk + HH:MM Name [Bid]")
+                await ctx.send("Usage: !worker + HH:MM Name [Bid]")
                 return
             time_value = parts[2]
             name = parts[3]
             bid = parts[4] if len(parts) > 4 else "No bid"
-            target_time = datetime.strptime(time_value, "%H:%M").time()
+            end_time = datetime.strptime(time_value, "%H:%M").time()
         except:
-            await ctx.send("Invalid format. Example: !wrk + 19:55 Eiffel 3M")
+            await ctx.send("Invalid format. Example: !worker + 19:55 Eiffel 3M")
             return
 
         now = get_now(guild_id)
-        target_datetime = datetime.combine(now.date(), target_time)
-        if target_datetime < now:
-            target_datetime += timedelta(days=1)
+        end_datetime = datetime.combine(now.date(), end_time)
+        if end_datetime < now:
+            end_datetime += timedelta(days=1)
 
         alarms.setdefault(guild_id, {})
         alarms[guild_id].setdefault(post_channel.id, {})
         alarms[guild_id][post_channel.id].setdefault(ctx.author.id, {})
 
         task = asyncio.create_task(
-            run_alarm(ctx, guild_id, post_channel, target_datetime, time_value, name, bid)
+            run_alarm(guild_id, post_channel, end_datetime, time_value, name, bid, setup_info)
         )
         alarms[guild_id][post_channel.id][ctx.author.id][time_value] = {
             "task": task,
             "name": name,
             "bid": bid,
-            "target_datetime": target_datetime
+            "end_datetime": end_datetime
         }
 
         # Start live dashboard if not running
@@ -290,11 +298,12 @@ async def wrk(ctx, action=None, arg1=None, arg2=None):
 
         await update_dashboard(guild_id, post_channel)
 
-    # REMOVE
+    # REMOVE ALARM
     elif action == "-":
         time_value = arg1
-        if time_value in alarms[guild_id][post_channel.id][ctx.author.id]:
-            alarms[guild_id][post_channel.id][ctx.author.id][time_value]["task"].cancel()
+        user_alarms = alarms[guild_id][post_channel.id].get(ctx.author.id, {})
+        if time_value in user_alarms:
+            user_alarms[time_value]["task"].cancel()
             await update_dashboard(guild_id, post_channel)
 
 
@@ -305,4 +314,6 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
 
 
-bot.run("YOUR_BOT_TOKEN_HERE")
+# ------------------ RUN BOT ------------------
+TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+bot.run(TOKEN)
