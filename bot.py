@@ -13,7 +13,7 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-DATA_FILE = "data/worker_data.json"
+DATA_FILE = "/data/worker_data.json"
 os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
 
 # ------------------ RUNTIME STORAGE ------------------
