@@ -176,6 +176,20 @@ async def run_alarm(guild_id, post_channel, end_datetime, time_str, name, bid, s
 
 
 # ------------------ WORKER COMMAND ------------------
+@bot.command(name="worker_help")
+async def worker_help(ctx):
+    await ctx.send(
+        "**Worker Commands**\n"
+        "`!worker + HH:MM Name [Bid]` — add alarm\n"
+        "`!worker - HH:MM` — remove alarm\n"
+        "`!worker setup #post-channel @Role` — set post channel & role\n"
+        "`!worker timezone X` — set GMT offset\n"
+        "`!worker AddRole @Role` — allow role to use bot\n"
+        "`!worker RemoveRole @Role`\n"
+        "`!worker ListRoles`\n"
+        "`!worker_help` — show this help message"
+    )
+
 @bot.command()
 async def worker(ctx, action=None, arg1=None, arg2=None):
     guild_id = ctx.guild.id
