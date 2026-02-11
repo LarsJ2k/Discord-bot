@@ -63,7 +63,7 @@ def now_utc() -> datetime:
 
 
 def utc_to_local(dt_utc: datetime, offset_hours: int) -> datetime:
-    """Convert UTC-aware dt to 'guild local' (still aware)."""
+    """Convert UTC-aware dt to 'guild local' clock time (still aware)."""
     return dt_utc + timedelta(hours=offset_hours)
 
 
@@ -154,7 +154,8 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
             blocks.append(
                 f"**{name}**\n"
                 f"Bid - {bid}\n"
-                f"<t:{begin_ts}:t>  <t:{end_ts}:t>  <t:{end_ts}:R>"
+                f"🟢 Start      🔵 End      ⏳ Time left\n"
+                f"<t:{begin_ts}:t>        <t:{end_ts}:t>        <t:{end_ts}:R>"
             )
 
         embed.description = "\n\n---\n\n".join(blocks)
@@ -209,8 +210,10 @@ async def run_alarm(
             wait_seconds = (end_utc - timedelta(minutes=minutes) - now_utc()).total_seconds()
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
+
+                unit = "minute" if minutes == 1 else "minutes"
                 await post_channel.send(
-                    f"{role_mention} ⏳ — {minutes} minute(s) until **{name}** ({bid}) at {time_str}!"
+                    f"{role_mention} {minutes} {unit} until {name} ({bid})"
                 )
 
         wait_seconds = (end_utc - now_utc()).total_seconds()
@@ -218,7 +221,7 @@ async def run_alarm(
             await asyncio.sleep(wait_seconds)
 
         await post_channel.send(
-            f"{role_mention} 🚨 — ALARM for **{name}** ({bid}) — {time_str}!"
+            f"{role_mention} 🚨 {name} ({bid}) is starting now!"
         )
 
     except asyncio.CancelledError:
@@ -302,7 +305,6 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
 
         setups = data[str(guild_id)]["channel_setups"]
 
-        # Find the command-channel mapping that points to this post-channel
         cmd_channel_to_remove = None
         for cmd_channel_id, info in setups.items():
             if info.get("post_channel_id") == post_channel.id:
@@ -440,14 +442,14 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
         offset = int(data[str(guild_id)]["timezone"])
 
         # Determine "today" in guild-local time
-        now_u = now_utc()
-        now_local = utc_to_local(now_u, offset)
+        nu = now_utc()
+        nu_local = utc_to_local(nu, offset)
 
         # Build naive local end datetime, then convert to UTC
-        end_local_naive = datetime.combine(now_local.date(), end_time)
+        end_local_naive = datetime.combine(nu_local.date(), end_time)
 
         # If time already passed in local, schedule next day
-        if end_local_naive < now_local.replace(tzinfo=None):
+        if end_local_naive < nu_local.replace(tzinfo=None):
             end_local_naive += timedelta(days=1)
 
         end_utc = local_naive_to_utc(end_local_naive, offset)
@@ -465,7 +467,7 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
             "task": task,
             "name": name,
             "bid": bid,
-            "end_datetime": end_utc  # store UTC-aware so Discord <t:...> works correctly per viewer
+            "end_datetime": end_utc  # UTC-aware for Discord <t:...> per viewer
         }
 
         # Start live dashboard if not running
