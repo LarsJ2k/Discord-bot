@@ -507,6 +507,8 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
 @bot.event
 async def on_ready():
     load_data()
+    print("DATA FILE PATH:", os.path.abspath(DATA_FILE))
+    print("FILE EXISTS:", os.path.exists(DATA_FILE))
     print(f"Logged in as {bot.user} (id={bot.user.id})")
 
 
