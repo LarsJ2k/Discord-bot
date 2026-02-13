@@ -178,14 +178,14 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
             begin_ts = int(begin_dt.timestamp())
             end_ts = int(end_dt.timestamp())
 
-            blocks.append(
-                f"**{name}**\n"
-                f"Bid - {bid}\n"
-                f"```"
-                f"{'Start':<8}{'End':<8}{'Time left'}\n"
-                f"{'<t:'+str(begin_ts)+':t>':<8}{'<t:'+str(end_ts)+':t>':<8}{'<t:'+str(end_ts)+':R>'}"
-                f"```"
-            )
+        space = "\u2003\u2003"
+        
+        blocks.append(
+            f"**{name}**\n"
+            f"Bid - {bid}\n"
+            f"🟢 Start{space}🏁 End{space}⏳ Time left\n"
+            f"<t:{begin_ts}:t>{space}<t:{end_ts}:t>{space}<t:{end_ts}:R>\n"
+        )
 
         embed.description = "\n\n---\n\n".join(blocks)
 
