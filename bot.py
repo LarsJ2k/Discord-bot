@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import shlex
+from threading import Lock
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -16,38 +17,76 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 DATA_FILE = "/data/worker_data.json"
 os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
 
+# If bot was offline and alarm time passed:
+# - If alarm ended less than GRACE_SECONDS ago => fire immediately ("late")
+# - Else => drop and delete from JSON
+GRACE_SECONDS = 5 * 60
+
 # ------------------ RUNTIME STORAGE ------------------
 # alarms: {guild_id: {post_channel_id: {user_id: {time_str: {"task":..., "name":..., "bid":..., "end_datetime":...}}}}}
 alarms = {}
 dashboard_messages = {}  # {guild_id: {post_channel_id: discord.Message}}
 dashboard_tasks = {}     # {guild_id: {post_channel_id: asyncio.Task}}
 dashboard_locks = {}     # {(guild_id, post_channel_id): asyncio.Lock()}
-data = {}                # persistent storage (roles/setup/timezone only)
+data = {}                # persistent storage
 
+data_file_lock = Lock()
 
 # ------------------ DATA HANDLING ------------------
 def load_data():
     global data
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    else:
-        data = {}
-
+    with data_file_lock:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = {}
 
 def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
-
+    with data_file_lock:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
 
 def ensure_guild(guild_id: int):
     if str(guild_id) not in data:
         data[str(guild_id)] = {
             "roles": [],
-            "channel_setups": {},  # keyed by command-channel-id (string) -> {post_channel_id, role_id}
-            "timezone": 0          # GMT offset for entering HH:MM
+            "channel_setups": {},   # {command_channel_id: {post_channel_id, role_id}}
+            "timezone": 0,          # GMT offset for entering HH:MM
+            "alarms": {}            # {post_channel_id: {user_id: {HH:MM: {name,bid,end_utc}}}}
         }
+    else:
+        # Backward compatible: if you had older JSON without alarms key
+        data[str(guild_id)].setdefault("alarms", {})
 
+def persist_alarm(guild_id: int, post_channel_id: int, user_id: int, time_str: str, name: str, bid: str, end_utc: datetime):
+    ensure_guild(guild_id)
+    g = data[str(guild_id)]
+    g["alarms"].setdefault(str(post_channel_id), {})
+    g["alarms"][str(post_channel_id)].setdefault(str(user_id), {})
+    g["alarms"][str(post_channel_id)][str(user_id)][time_str] = {
+        "name": name,
+        "bid": bid,
+        "end_utc": end_utc.isoformat()
+    }
+    save_data()
+
+def remove_persisted_alarm(guild_id: int, post_channel_id: int, user_id: int, time_str: str):
+    ensure_guild(guild_id)
+    g = data[str(guild_id)]
+    a = g.get("alarms", {})
+    pc = a.get(str(post_channel_id), {})
+    ua = pc.get(str(user_id), {})
+
+    ua.pop(time_str, None)
+
+    # cleanup empties
+    if not ua:
+        pc.pop(str(user_id), None)
+    if not pc:
+        a.pop(str(post_channel_id), None)
+
+    save_data()
 
 # ------------------ PERMISSION CHECK ------------------
 def has_permission(member: discord.Member, guild_id: int) -> bool:
@@ -57,24 +96,15 @@ def has_permission(member: discord.Member, guild_id: int) -> bool:
     allowed_roles = set(data[str(guild_id)]["roles"])
     return any(role.id in allowed_roles for role in member.roles)
 
-
 # ------------------ TIME ------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def utc_to_local(dt_utc: datetime, offset_hours: int) -> datetime:
-    """Convert UTC-aware dt to 'guild local' clock time (still aware)."""
     return dt_utc + timedelta(hours=offset_hours)
 
-
 def local_naive_to_utc(dt_local_naive: datetime, offset_hours: int) -> datetime:
-    """
-    Interpret dt_local_naive as guild-local clock time (UTC+offset).
-    Convert to UTC-aware datetime.
-    """
     return (dt_local_naive - timedelta(hours=offset_hours)).replace(tzinfo=timezone.utc)
-
 
 # ------------------ HELPERS ------------------
 async def get_channel_safe(guild: discord.Guild, channel_id: int) -> discord.TextChannel | None:
@@ -87,9 +117,7 @@ async def get_channel_safe(guild: discord.Guild, channel_id: int) -> discord.Tex
     except (discord.NotFound, discord.Forbidden):
         return None
 
-
 def find_setup_for_post_channel(guild_id: int, post_channel_id: int):
-    """Return setup dict that has this post_channel_id, else None."""
     ensure_guild(guild_id)
     setups = data[str(guild_id)]["channel_setups"]
     for _cmd_channel_id, info in setups.items():
@@ -97,10 +125,8 @@ def find_setup_for_post_channel(guild_id: int, post_channel_id: int):
             return info
     return None
 
-
 # ------------------ DASHBOARD ------------------
 async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
-    # Prevent send/send race creating duplicate dashboard posts
     key = (guild_id, post_channel.id)
     lock = dashboard_locks.setdefault(key, asyncio.Lock())
 
@@ -134,13 +160,13 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
 
         embed = discord.Embed(title="🔔 Upcoming Workers", color=discord.Color.blue())
 
-        # Build blocks in chronological order
+        # Chronological blocks
         items = []
         for _user_id, user_alarms in post_alarms.items():
             for _time_str, alarm_data in user_alarms.items():
                 items.append(alarm_data)
 
-        items.sort(key=lambda a: a["end_datetime"])  # UTC-aware
+        items.sort(key=lambda a: a["end_datetime"])  # UTC-aware datetime
 
         blocks = []
         for alarm_data in items:
@@ -148,24 +174,23 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
             bid = alarm_data["bid"]
             end_dt = alarm_data["end_datetime"]
             begin_dt = end_dt - timedelta(minutes=55)
-        
+
             begin_ts = int(begin_dt.timestamp())
             end_ts = int(end_dt.timestamp())
-        
+
             blocks.append(
                 f"**{name}**\n"
                 f"Bid - {bid}\n"
-                f"🟢 Start      🏁 End      ⏳ Time left\n"
-                f"<t:{begin_ts}:t>      <t:{end_ts}:t>      <t:{end_ts}:R>"
+                f"```"
+                f"{'Start':<8}{'End':<8}{'Time left'}\n"
+                f"{'<t:'+str(begin_ts)+':t>':<8}{'<t:'+str(end_ts)+':t>':<8}{'<t:'+str(end_ts)+':R>'}"
+                f"```"
             )
 
-
-
         embed.description = "\n\n---\n\n".join(blocks)
-        
+
         dashboard_messages.setdefault(guild_id, {})
 
-        # Send or edit dashboard message
         if post_channel.id not in dashboard_messages[guild_id]:
             msg = await post_channel.send(
                 content=f"Upcoming workers {role_mention}",
@@ -182,7 +207,6 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
                 )
                 dashboard_messages[guild_id][post_channel.id] = msg
 
-
 # ------------------ LIVE DASHBOARD TASK ------------------
 async def live_dashboard_task(guild_id: int, post_channel: discord.TextChannel):
     try:
@@ -191,7 +215,6 @@ async def live_dashboard_task(guild_id: int, post_channel: discord.TextChannel):
             await asyncio.sleep(30)
     except asyncio.CancelledError:
         pass
-
 
 # ------------------ ALARM TASK ------------------
 async def run_alarm(
@@ -202,38 +225,33 @@ async def run_alarm(
     time_str: str,
     name: str,
     bid: str,
-    setup: dict | None
+    setup: dict | None,
+    fire_immediately: bool = False
 ):
     role_mention = f"<@&{setup['role_id']}>" if setup else ""
-    warnings = [10, 5, 1]  # minutes before end
+    warnings = [10, 5, 1]
 
     try:
+        if fire_immediately:
+            await post_channel.send(
+                f"{role_mention} 🚨 {name} ({bid}) is starting now! (late)"
+            )
+            return
+
         for minutes in warnings:
             wait_seconds = (end_utc - timedelta(minutes=minutes) - now_utc()).total_seconds()
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
-
                 unit = "minute" if minutes == 1 else "minutes"
-                await post_channel.send(
-                    f"{role_mention} {minutes} {unit} until {name} ({bid})"
-                )
-
-        wait_seconds = (end_utc - now_utc()).total_seconds()
-        if wait_seconds > 0:
-            await asyncio.sleep(wait_seconds)
-
-        await post_channel.send(
-            f"{role_mention} 🚨 {name} ({bid}) is starting now!"
-        )
+                await post_channel.send(f"{role_mention} {minutes} {unit} until {name} ({bid})")
 
     except asyncio.CancelledError:
-        # Silent cancel: command handler already confirmed
         raise
 
     finally:
         alarms.get(guild_id, {}).get(post_channel.id, {}).get(user_id, {}).pop(time_str, None)
+        remove_persisted_alarm(guild_id, post_channel.id, user_id, time_str)
         await update_dashboard(guild_id, post_channel)
-
 
 # ------------------ COMMANDS ------------------
 @bot.command(name="worker_help")
@@ -251,7 +269,6 @@ async def worker_help(ctx: commands.Context):
         "`!worker help` — show this help"
     )
 
-
 @bot.command()
 async def worker(ctx: commands.Context, action: str | None = None, arg1: str | None = None, arg2: str | None = None):
     if ctx.guild is None:
@@ -261,7 +278,6 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
     guild_id = ctx.guild.id
     ensure_guild(guild_id)
 
-    # --- HELP ---
     if action in (None, "help"):
         await worker_help(ctx)
         return
@@ -306,7 +322,6 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
             return
 
         setups = data[str(guild_id)]["channel_setups"]
-
         cmd_channel_to_remove = None
         for cmd_channel_id, info in setups.items():
             if info.get("post_channel_id") == post_channel.id:
@@ -317,7 +332,7 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
             await ctx.send("No setup found for that post channel.")
             return
 
-        # Stop live dashboard task
+        # Stop dashboard loop
         if guild_id in dashboard_tasks and post_channel.id in dashboard_tasks[guild_id]:
             dashboard_tasks[guild_id][post_channel.id].cancel()
             dashboard_tasks[guild_id].pop(post_channel.id, None)
@@ -330,17 +345,17 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
                 pass
             dashboard_messages[guild_id].pop(post_channel.id, None)
 
-        # Cancel all alarms for that post channel
+        # Cancel all alarms in this channel (runtime + persisted)
         if guild_id in alarms and post_channel.id in alarms[guild_id]:
-            for _user_id, user_alarms in alarms[guild_id][post_channel.id].items():
+            for user_id, user_alarms in alarms[guild_id][post_channel.id].items():
                 for alarm in user_alarms.values():
                     alarm["task"].cancel()
             alarms[guild_id].pop(post_channel.id, None)
 
-        # Remove lock
-        dashboard_locks.pop((guild_id, post_channel.id), None)
+        # Remove persisted alarms for this post channel
+        data[str(guild_id)]["alarms"].pop(str(post_channel.id), None)
 
-        # Remove persistent setup mapping
+        dashboard_locks.pop((guild_id, post_channel.id), None)
         setups.pop(cmd_channel_to_remove, None)
         save_data()
 
@@ -419,7 +434,6 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
         await ctx.send("Configured post channel not found or not accessible.")
         return
 
-    # Ensure runtime containers exist
     alarms.setdefault(guild_id, {})
     alarms[guild_id].setdefault(post_channel.id, {})
     alarms[guild_id][post_channel.id].setdefault(ctx.author.id, {})
@@ -428,7 +442,6 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
     if action == "+":
         try:
             parts = shlex.split(ctx.message.content)
-            # Example: !worker + 19:55 "Eiffel" 3M
             if len(parts) < 4:
                 await ctx.send("Usage: `!worker + HH:MM Name [Bid]`")
                 return
@@ -443,23 +456,20 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
 
         offset = int(data[str(guild_id)]["timezone"])
 
-        # Determine "today" in guild-local time
         nu = now_utc()
         nu_local = utc_to_local(nu, offset)
 
-        # Build naive local end datetime, then convert to UTC
         end_local_naive = datetime.combine(nu_local.date(), end_time)
-
-        # If time already passed in local, schedule next day
         if end_local_naive < nu_local.replace(tzinfo=None):
             end_local_naive += timedelta(days=1)
 
         end_utc = local_naive_to_utc(end_local_naive, offset)
 
-        # Replace existing alarm for this user+time, if any
+        # Replace existing alarm for this user+time
         existing = alarms[guild_id][post_channel.id][ctx.author.id].get(time_value)
         if existing:
             existing["task"].cancel()
+            remove_persisted_alarm(guild_id, post_channel.id, ctx.author.id, time_value)
 
         task = asyncio.create_task(
             run_alarm(guild_id, post_channel, ctx.author.id, end_utc, time_value, name, bid, setup_info)
@@ -469,10 +479,11 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
             "task": task,
             "name": name,
             "bid": bid,
-            "end_datetime": end_utc  # UTC-aware for Discord <t:...> per viewer
+            "end_datetime": end_utc
         }
 
-        # Start live dashboard if not running
+        persist_alarm(guild_id, post_channel.id, ctx.author.id, time_value, name, bid, end_utc)
+
         dashboard_tasks.setdefault(guild_id, {})
         if post_channel.id not in dashboard_tasks[guild_id]:
             dashboard_tasks[guild_id][post_channel.id] = asyncio.create_task(
@@ -496,21 +507,90 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
             return
 
         user_alarms[time_value]["task"].cancel()
+        remove_persisted_alarm(guild_id, post_channel.id, ctx.author.id, time_value)
+
         await ctx.send(f"✅ Alarm {time_value} cancelled.")
         await update_dashboard(guild_id, post_channel)
         return
 
     await ctx.send("Unknown action. Try `!worker help`.")
 
+# ------------------ RESTORE ON STARTUP ------------------
+async def restore_persisted_alarms():
+    # Recreate runtime tasks from JSON
+    for guild in bot.guilds:
+        guild_id = guild.id
+        ensure_guild(guild_id)
+
+        persisted = data[str(guild_id)].get("alarms", {})
+        if not persisted:
+            continue
+
+        restored_any_for_guild = False
+
+        for post_channel_id_str, users in list(persisted.items()):
+            post_channel = await get_channel_safe(guild, int(post_channel_id_str))
+            if post_channel is None:
+                continue
+
+            setup_info = find_setup_for_post_channel(guild_id, post_channel.id)
+
+            alarms.setdefault(guild_id, {})
+            alarms[guild_id].setdefault(post_channel.id, {})
+
+            restored_any_for_channel = False
+
+            for user_id_str, times in list(users.items()):
+                user_id = int(user_id_str)
+                alarms[guild_id][post_channel.id].setdefault(user_id, {})
+
+                for time_str, a in list(times.items()):
+                    try:
+                        end_utc = datetime.fromisoformat(a["end_utc"])
+                        if end_utc.tzinfo is None:
+                            end_utc = end_utc.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        remove_persisted_alarm(guild_id, post_channel.id, user_id, time_str)
+                        continue
+
+                    name = a.get("name", "Unknown")
+                    bid = a.get("bid", "No bid")
+
+                    now = now_utc()
+
+                    # Expired: clean it up
+                    if end_utc <= now:
+                        remove_persisted_alarm(guild_id, post_channel.id, user_id, time_str)
+                        continue
+
+                    # Schedule normal
+                    task = asyncio.create_task(
+                        run_alarm(guild_id, post_channel, user_id, end_utc, time_str, name, bid, setup_info)
+                    )
+                    alarms[guild_id][post_channel.id][user_id][time_str] = {
+                        "task": task,
+                        "name": name,
+                        "bid": bid,
+                        "end_datetime": end_utc
+                    }
+                    restored_any_for_channel = True
+                    restored_any_for_guild = True
+
+            # Start dashboard loop if we restored anything
+            if restored_any_for_channel:
+                dashboard_tasks.setdefault(guild_id, {})
+                if post_channel.id not in dashboard_tasks[guild_id]:
+                    dashboard_tasks[guild_id][post_channel.id] = asyncio.create_task(
+                        live_dashboard_task(guild_id, post_channel)
+                    )
+                await update_dashboard(guild_id, post_channel)
 
 # ------------------ BOT READY ------------------
 @bot.event
 async def on_ready():
     load_data()
-    print("DATA FILE PATH:", os.path.abspath(DATA_FILE))
-    print("FILE EXISTS:", os.path.exists(DATA_FILE))
     print(f"Logged in as {bot.user} (id={bot.user.id})")
-
+    await restore_persisted_alarms()
 
 # ------------------ RUN BOT ------------------
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
