@@ -210,7 +210,8 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
         items.sort(key=lambda a: a["end_datetime"])  # UTC-aware datetime
 
         # Wider spacing using unicode EM SPACE (won't collapse)
-        gap = "\u2003\u2003\u2003"  # 3 em-spaces
+        gap = "\u2003\u2003"  # 2 em-spaces
+        gap2 = "\u2003\u2003\u2003"  # 3 em-spaces
 
         blocks = []
         for alarm_data in items:
@@ -226,7 +227,7 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
                 f"**{name}**\n"
                 f"Bid - {bid}\n"
                 f"🟢 Start{gap}🏁 End{gap}⏳ Time left\n"
-                f"<t:{begin_ts}:t>{gap}<t:{end_ts}:t>{gap}<t:{end_ts}:R>"
+                f"<t:{begin_ts}:t>{gap2}<t:{end_ts}:t>{gap2}<t:{end_ts}:R>"
             )
 
         embed.description = "\n\n---\n\n".join(blocks)
