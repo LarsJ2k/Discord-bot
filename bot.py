@@ -223,11 +223,13 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
             begin_ts = int(begin_dt.timestamp())
             end_ts = int(end_dt.timestamp())
 
+            bid_line = f"Bid - {bid}\n" if bid else ""
+            
             blocks.append(
                 f"**{name}**\n"
-                f"Bid - {bid}\n"
+                f"{bid_line}"
                 f"🟢 Start{gap}🏁 End{gap}⏳ Time left\n"
-                f"<t:{begin_ts}:t>{gap2}<t:{end_ts}:t>{gap2}<t:{end_ts}:R>"
+                f"<t:{begin_ts}:t>{gap}<t:{end_ts}:t>{gap}<t:{end_ts}:R>"
             )
 
         embed.description = "\n\n---\n\n".join(blocks)
@@ -281,8 +283,11 @@ async def run_alarm(
             wait_seconds = (end_utc - timedelta(minutes=minutes) - now_utc()).total_seconds()
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
+                bid_part = f" ({bid})" if bid else ""
                 unit = "minute" if minutes == 1 else "minutes"
-                await post_channel.send(f"{role_mention} {minutes} {unit} until {name} ({bid})")
+                await post_channel.send(
+                    f"{role_mention} {minutes} {unit} until {name}{bid_part}"
+                )
 
         # ❌ No "0 minutes / starting now" message on purpose
 
@@ -498,7 +503,7 @@ async def worker(ctx: commands.Context, action: str | None = None, arg1: str | N
 
             time_value = parts[2]
             name = parts[3]
-            bid = parts[4] if len(parts) > 4 else "No bid"
+            bid = parts[4] if len(parts) > 4 else None
             end_time = datetime.strptime(time_value, "%H:%M").time()
         except:
             await ctx.send('Invalid format. Example: `!worker + 19:55 "Eiffel" 3M`')
@@ -613,7 +618,7 @@ async def restore_persisted_alarms():
                         continue
 
                     name = a.get("name", "Unknown")
-                    bid = a.get("bid", "No bid")
+                    bid = a.get("bid")  # can be None
 
                     task = asyncio.create_task(
                         run_alarm(guild_id, post_channel, user_id, end_utc, time_str, name, bid, setup_info)
