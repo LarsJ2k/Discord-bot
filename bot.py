@@ -226,7 +226,7 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
             bid_line = f"Bid - {bid}\n" if bid else ""
             
             blocks.append(
-                f"##{name}\n"
+                f"## {name}\n"
                 f"{bid_line}"
                 f"🟢 Start{gap}🏁 End{gap}⏳ Time left\n"
                 f"<t:{begin_ts}:t>{gap}<t:{end_ts}:t>{gap}<t:{end_ts}:R>"
