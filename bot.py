@@ -226,7 +226,7 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
             bid_line = f"Bid - {bid}\n" if bid else ""
             
             blocks.append(
-                f"**{name}**\n"
+                f"##{name}\n"
                 f"{bid_line}"
                 f"🟢 Start{gap}🏁 End{gap}⏳ Time left\n"
                 f"<t:{begin_ts}:t>{gap}<t:{end_ts}:t>{gap}<t:{end_ts}:R>"
@@ -286,7 +286,7 @@ async def run_alarm(
                 bid_part = f" ({bid})" if bid else ""
                 unit = "minute" if minutes == 1 else "minutes"
                 await post_channel.send(
-                    f"{role_mention} {minutes} {unit} until {name}{bid_part}"
+                    f"{role_mention} {minutes} {unit} until **{name}**{bid_part}"
                 )
 
         # ❌ No "0 minutes / starting now" message on purpose
