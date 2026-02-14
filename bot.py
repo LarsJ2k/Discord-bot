@@ -232,7 +232,7 @@ async def update_dashboard(guild_id: int, post_channel: discord.TextChannel):
                 f"<t:{begin_ts}:t>{gap}<t:{end_ts}:t>{gap}<t:{end_ts}:R>"
             )
 
-        embed.description = "\n\n---\n\n".join(blocks)
+        embed.description = "\n\n---\n".join(blocks)
 
         dashboard_messages.setdefault(guild_id, {})
 
